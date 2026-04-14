@@ -19,6 +19,8 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import time
 import json
+import os
+import io
 
 # ─────────────────────────────────────────────
 # 1. PHYSICS SIMULATOR — generates ground-truth trajectories
@@ -203,6 +205,300 @@ class PhysicsPredictor(nn.Module):
             'energy': energy.item() if energy.dim() == 0 else energy.squeeze().tolist(),
             'momentum': momentum.squeeze().tolist(),
         }
+
+
+class VideoFrameEncoder(nn.Module):
+    """Encodes video frames into latent representations for vision-based world model."""
+
+    def __init__(self, frame_channels=3, frame_size=64, latent_dim=128):
+        super().__init__()
+        self.frame_size = frame_size
+        self.encoder = nn.Sequential(
+            nn.Conv2d(frame_channels, 32, 4, stride=2, padding=1),  # 32x32
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),              # 16x16
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),             # 8x8
+            nn.ReLU(),
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),            # 4x4
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(256 * 4 * 4, latent_dim),
+        )
+
+    def forward(self, frames):
+        return self.encoder(frames)
+
+
+class VideoFrameDecoder(nn.Module):
+    """Decodes latent representations back to video frames."""
+
+    def __init__(self, frame_channels=3, frame_size=64, latent_dim=128):
+        super().__init__()
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 256 * 4 * 4),
+            nn.ReLU(),
+            nn.Unflatten(1, (256, 4, 4)),
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),   # 8x8
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),    # 16x16
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),     # 32x32
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, frame_channels, 4, stride=2, padding=1),  # 64x64
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z):
+        return self.decoder(z)
+
+
+class VideoWorldModel(nn.Module):
+    """
+    Vision-based world model for learning physics from video.
+    Designed to work with EgoVerse or any video dataset.
+
+    Architecture: Frame Encoder → Latent Dynamics → Frame Decoder
+    The model must learn physics to predict future frames.
+    """
+
+    def __init__(self, frame_channels=3, frame_size=64, latent_dim=128, action_dim=0):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.action_dim = action_dim
+
+        self.encoder = VideoFrameEncoder(frame_channels, frame_size, latent_dim)
+        self.decoder = VideoFrameDecoder(frame_channels, frame_size, latent_dim)
+
+        # Latent dynamics: predict next latent state
+        dynamics_input = latent_dim + action_dim
+        self.dynamics = nn.Sequential(
+            nn.Linear(dynamics_input, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, latent_dim),
+        )
+
+        # Physics probes on the latent space
+        self.gravity_probe = nn.Linear(latent_dim, 1)
+        self.velocity_probe = nn.Linear(latent_dim, 2)
+        self.contact_probe = nn.Linear(latent_dim, 1)
+
+    def forward(self, frame, action=None):
+        z = self.encoder(frame)
+        if action is not None:
+            z_input = torch.cat([z, action], dim=-1)
+        else:
+            z_input = z
+        z_next = self.dynamics(z_input)
+        frame_next = self.decoder(z_next)
+        return frame_next, z, z_next
+
+    def encode(self, frame):
+        return self.encoder(frame)
+
+
+class EgoVerseLoader:
+    """
+    Interface for loading and processing EgoVerse data.
+
+    EgoVerse contains ~129M frames of egocentric manipulation video
+    across 400 scenes with paired action data. Data is stored in Zarr format
+    and accessible via S3-compatible API.
+
+    For the MVP, we support:
+    1. Synthetic video generation (demo mode — no download needed)
+    2. Local video file loading
+    3. EgoVerse S3 download (requires setup)
+    """
+
+    EGOVERSE_TASKS = [
+        "decorating cakes", "sewing fabric", "glazing cookies",
+        "planting lemongrass", "disassembling phones", "decanting perfume",
+        "folding clothes", "pouring liquid", "stacking blocks",
+        "opening jars", "cutting vegetables", "wiping surfaces",
+    ]
+
+    @staticmethod
+    def generate_synthetic_video(n_frames=60, frame_size=64, n_objects=3,
+                                  gravity=9.81, scenario="falling_objects"):
+        """
+        Generate synthetic video frames from physics simulation.
+        This bridges the 2D simulator to the video world model.
+        """
+        world = PhysicsWorld(n_objects=n_objects, gravity=gravity,
+                             width=frame_size, height=frame_size)
+        positions, velocities, masses, radii = world.random_state()
+
+        # Scale positions to frame coordinates
+        positions *= (frame_size / 10.0)
+        radii_px = radii * (frame_size / 10.0)
+
+        frames = []
+        for t in range(n_frames):
+            # Render frame
+            frame = np.zeros((3, frame_size, frame_size), dtype=np.float32)
+
+            # Draw background gradient (sky)
+            for y in range(frame_size):
+                frame[2, y, :] = 0.3 + 0.4 * (1 - y / frame_size)  # blue gradient
+
+            # Draw ground
+            ground_y = int(frame_size * 0.1)
+            frame[1, :ground_y, :] = 0.3  # green ground
+
+            # Draw objects as colored circles
+            colors = [
+                [0.9, 0.2, 0.2],  # red
+                [0.2, 0.8, 0.2],  # green
+                [0.2, 0.4, 0.9],  # blue
+                [0.9, 0.9, 0.2],  # yellow
+                [0.9, 0.2, 0.9],  # magenta
+                [0.2, 0.9, 0.9],  # cyan
+            ]
+
+            for i in range(n_objects):
+                cx, cy = int(positions[i, 0]), int(positions[i, 1])
+                r = max(2, int(radii_px[i]))
+                color = colors[i % len(colors)]
+
+                for dy in range(-r, r+1):
+                    for dx in range(-r, r+1):
+                        if dx*dx + dy*dy <= r*r:
+                            px_x = cx + dx
+                            px_y = cy + dy
+                            if 0 <= px_x < frame_size and 0 <= px_y < frame_size:
+                                for c in range(3):
+                                    frame[c, px_y, px_x] = color[c]
+
+            frames.append(frame)
+
+            # Step physics (scale back to world coords, step, scale back)
+            pos_world = positions / (frame_size / 10.0)
+            vel_world = velocities / (frame_size / 10.0)
+            pos_world, vel_world = world.step(pos_world, vel_world, masses, radii)
+            positions = pos_world * (frame_size / 10.0)
+            velocities = vel_world * (frame_size / 10.0)
+
+        return np.array(frames), masses
+
+    @staticmethod
+    def load_local_video(video_path, frame_size=64, max_frames=120):
+        """Load a local video file and extract frames."""
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            frames = []
+            while len(frames) < max_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame = cv2.resize(frame, (frame_size, frame_size))
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = frame.astype(np.float32) / 255.0
+                frame = np.transpose(frame, (2, 0, 1))  # HWC -> CHW
+                frames.append(frame)
+            cap.release()
+            return np.array(frames) if frames else None
+        except ImportError:
+            return None
+
+    @staticmethod
+    def get_egoverse_info():
+        """Return information about EgoVerse dataset for the UI."""
+        return {
+            'total_episodes': 54088,
+            'total_frames': 128948271,
+            'hours': 1194,
+            'scenes': 400,
+            'tasks': 4949,
+            'objects': 120,
+            'format': 'Zarr / LeRobot',
+            'repo': 'https://github.com/GaTech-RL2/EgoVerse',
+            'explorer': 'https://partners.mecka.ai/egoverse',
+        }
+
+
+class VideoPhysicsEngine:
+    """Training engine for the video-based world model."""
+
+    def __init__(self, frame_size=64, latent_dim=128, lr=1e-3, action_dim=0):
+        self.model = VideoWorldModel(
+            frame_size=frame_size,
+            latent_dim=latent_dim,
+            action_dim=action_dim,
+        )
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.loss_fn = nn.MSELoss()
+        self.training_losses = []
+
+    def train_step(self, frames, batch_size=16):
+        """Train on frame pairs (frame_t, frame_{t+1})."""
+        self.model.train()
+        n_frames = len(frames)
+
+        # Sample random pairs
+        indices = np.random.choice(n_frames - 1, min(batch_size, n_frames - 1), replace=False)
+        current_frames = torch.FloatTensor(frames[indices])
+        next_frames = torch.FloatTensor(frames[indices + 1])
+
+        # Predict next frame
+        pred_next, z, z_next = self.model(current_frames)
+        recon_loss = self.loss_fn(pred_next, next_frames)
+
+        # Latent smoothness
+        smooth_loss = torch.mean((z_next - z) ** 2) * 0.01
+
+        total_loss = recon_loss + smooth_loss
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        return recon_loss.item()
+
+    def evaluate(self, frames, n_samples=32):
+        """Evaluate prediction quality."""
+        self.model.eval()
+        n_frames = len(frames)
+        indices = np.random.choice(n_frames - 1, min(n_samples, n_frames - 1), replace=False)
+
+        with torch.no_grad():
+            current = torch.FloatTensor(frames[indices])
+            target = torch.FloatTensor(frames[indices + 1])
+            pred, z, _ = self.model(current)
+
+            mse = self.loss_fn(pred, target).item()
+            # PSNR
+            psnr = -10 * np.log10(mse + 1e-10)
+
+            # Gravity probe
+            g_pred = self.model.gravity_probe(z).mean().item()
+
+            # Latent analysis
+            z_std = torch.std(z, dim=0).mean().item()
+
+        return {
+            'mse': mse,
+            'psnr': psnr,
+            'gravity_probe': g_pred,
+            'latent_std': z_std,
+        }
+
+    def get_prediction_frames(self, frames, start_idx=0, n_predict=20):
+        """Generate predicted frames autoregressively."""
+        self.model.eval()
+        predictions = []
+        current = torch.FloatTensor(frames[start_idx:start_idx+1])
+
+        with torch.no_grad():
+            for _ in range(n_predict):
+                pred, _, _ = self.model(current)
+                predictions.append(pred.squeeze().numpy())
+                current = pred
+
+        return np.array(predictions)
 
 
 class PhysicsDiscoveryEngine:
@@ -532,26 +828,65 @@ def plot_prediction_comparison(model, data, n_objects):
     return fig
 
 
-def main():
-    st.set_page_config(
-        page_title="Physics Discovery Engine",
-        page_icon="🔬",
-        layout="wide"
+def plot_video_frames(frames, title="Video Frames", n_show=8):
+    """Display a grid of video frames."""
+    n_frames = len(frames)
+    indices = np.linspace(0, n_frames - 1, min(n_show, n_frames), dtype=int)
+
+    fig = make_subplots(rows=1, cols=len(indices),
+                        subplot_titles=[f"t={i}" for i in indices])
+
+    for col, idx in enumerate(indices):
+        frame = frames[idx]
+        if frame.shape[0] == 3:  # CHW -> HWC
+            frame = np.transpose(frame, (1, 2, 0))
+        frame = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+
+        fig.add_trace(go.Image(z=frame), row=1, col=col+1)
+
+    fig.update_layout(
+        title=title,
+        height=250,
+        template='plotly_dark',
+        showlegend=False,
     )
+    for i in range(len(indices)):
+        fig.update_xaxes(showticklabels=False, row=1, col=i+1)
+        fig.update_yaxes(showticklabels=False, row=1, col=i+1)
+    return fig
 
-    st.title("Physics Discovery Engine")
-    st.markdown("""
-    **Can a neural network learn Newton's laws from scratch?**
 
-    Instead of encoding physics as constraints, this model is *rewarded* for
-    discovering physics. It watches simple 2D simulations and must learn to predict
-    what happens next. To predict well, it must implicitly learn gravity, momentum,
-    and collisions — like a baby learning about the world.
+def plot_video_predictions(true_frames, pred_frames, n_show=6):
+    """Side-by-side comparison of true vs predicted frames."""
+    n_frames = min(len(true_frames), len(pred_frames))
+    indices = np.linspace(0, n_frames - 1, min(n_show, n_frames), dtype=int)
 
-    *Inspired by conversations with Chelsea Finn on world models and physics-founded reasoning.*
-    """)
+    fig = make_subplots(rows=2, cols=len(indices),
+                        row_titles=['Ground Truth', 'Predicted'],
+                        column_titles=[f"t={i}" for i in indices])
 
-    st.divider()
+    for col, idx in enumerate(indices):
+        for row, frames in enumerate([true_frames, pred_frames]):
+            frame = frames[idx]
+            if frame.shape[0] == 3:
+                frame = np.transpose(frame, (1, 2, 0))
+            frame = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+            fig.add_trace(go.Image(z=frame), row=row+1, col=col+1)
+
+    fig.update_layout(
+        height=350,
+        template='plotly_dark',
+        showlegend=False,
+    )
+    for r in range(2):
+        for c in range(len(indices)):
+            fig.update_xaxes(showticklabels=False, row=r+1, col=c+1)
+            fig.update_yaxes(showticklabels=False, row=r+1, col=c+1)
+    return fig
+
+
+def run_simulation_tab():
+    """The original 2D physics simulation tab."""
 
     # ── Sidebar controls ──
     with st.sidebar:
@@ -600,7 +935,6 @@ def main():
                               title=f"Trajectory #{sample_idx} — {n_objects} objects, g={gravity}")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Show raw data stats
         with st.expander("Data Statistics"):
             all_pos = np.concatenate([d['positions'] for d in st.session_state['data']])
             all_vel = np.concatenate([d['velocities'] for d in st.session_state['data']])
@@ -631,13 +965,11 @@ def main():
         progress_bar = st.progress(0)
         status_text = st.empty()
         loss_chart = st.empty()
-        metrics_chart = st.empty()
 
         losses = []
         metrics_history = []
 
         for epoch in range(n_epochs):
-            # Multiple training steps per epoch
             epoch_losses = []
             for _ in range(10):
                 loss = engine.train_step(data, batch_size=batch_size)
@@ -646,7 +978,6 @@ def main():
             avg_loss = np.mean(epoch_losses)
             losses.append(avg_loss)
 
-            # Evaluate every 5 epochs
             if epoch % 5 == 0 or epoch == n_epochs - 1:
                 metrics = engine.evaluate_physics_discovery(data)
                 metrics['epoch'] = epoch
@@ -662,7 +993,6 @@ def main():
 
             progress_bar.progress((epoch + 1) / n_epochs)
 
-            # Update charts periodically
             if epoch % 10 == 0 or epoch == n_epochs - 1:
                 fig = plot_training_progress(losses, metrics_history)
                 loss_chart.plotly_chart(fig, use_container_width=True)
@@ -689,41 +1019,23 @@ def main():
 
     final_metrics = metrics_history[-1]
 
-    # Big metrics
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric(
-        "Discovered Gravity",
-        f"{final_metrics['discovered_gravity']:.3f}",
-        f"{final_metrics['gravity_error_pct']:.1f}% error"
-    )
-    col2.metric(
-        "True Gravity",
-        f"{final_metrics['true_gravity']:.2f}",
-    )
-    col3.metric(
-        "Prediction Error",
-        f"{final_metrics['prediction_error']:.6f}",
-    )
-    col4.metric(
-        "Latent Structure",
-        f"{final_metrics['latent_std']:.4f}",
-    )
+    col1.metric("Discovered Gravity",
+                f"{final_metrics['discovered_gravity']:.3f}",
+                f"{final_metrics['gravity_error_pct']:.1f}% error")
+    col2.metric("True Gravity", f"{final_metrics['true_gravity']:.2f}")
+    col3.metric("Prediction Error", f"{final_metrics['prediction_error']:.6f}")
+    col4.metric("Latent Structure", f"{final_metrics['latent_std']:.4f}")
 
-    # Prediction comparison
     st.subheader("Model Predictions vs Reality")
     st.markdown("Left: ground truth physics. Right: what the model predicts (autoregressively).")
     fig = plot_prediction_comparison(engine.model, data, n_obj)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Training curves
     st.subheader("Training Progress")
-    fig = plot_training_progress(
-        st.session_state['losses'],
-        metrics_history
-    )
+    fig = plot_training_progress(st.session_state['losses'], metrics_history)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Physics interpretation
     st.subheader("Interpretability Analysis")
     st.markdown("""
     **Key insight**: The model was never told about gravity, momentum, or energy.
@@ -738,10 +1050,8 @@ def main():
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Gravity Discovery**")
-        g_discovered = final_metrics['discovered_gravity']
-        g_true = final_metrics['true_gravity']
         g_pct = final_metrics['gravity_error_pct']
-
+        g_discovered = final_metrics['discovered_gravity']
         if g_pct < 10:
             st.success(f"The model discovered gravity! g = {g_discovered:.3f} (error: {g_pct:.1f}%)")
         elif g_pct < 30:
@@ -754,44 +1064,323 @@ def main():
         st.markdown(f"Predicted energy scale: `{final_metrics['discovered_energy']:.3f}`")
         st.markdown(f"True mean kinetic energy: `{final_metrics['true_energy']:.3f}`")
 
+
+def run_video_tab():
+    """Video-based world model tab with EgoVerse integration."""
+
+    st.header("Video World Model")
+    st.markdown("""
+    Scale up from structured state vectors to **raw video frames**.
+    The model learns to predict the next frame — and must discover physics to do it well.
+
+    This connects to [EgoVerse](https://partners.mecka.ai/egoverse) — a dataset of
+    **129M frames** of egocentric manipulation video across 400 real-world scenes.
+    """)
+
+    # EgoVerse info
+    with st.expander("About EgoVerse Dataset"):
+        info = EgoVerseLoader.get_egoverse_info()
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Episodes", f"{info['total_episodes']:,}")
+        col2.metric("Total Frames", f"{info['total_frames']:,}")
+        col3.metric("Hours of Video", f"{info['hours']:,}")
+        col4.metric("Unique Scenes", info['scenes'])
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Unique Tasks", f"{info['tasks']:,}")
+        col2.metric("Object Types", info['objects'])
+        col3.metric("Format", info['format'])
+
+        st.markdown(f"""
+        **Links:**
+        - [Interactive Explorer]({info['explorer']})
+        - [GitHub Repository]({info['repo']})
+
+        **Example tasks from EgoVerse:**
+        {', '.join(f'`{t}`' for t in EgoVerseLoader.EGOVERSE_TASKS)}
+
+        **To use real EgoVerse data**, clone the repo and run:
+        ```bash
+        git clone https://github.com/GaTech-RL2/EgoVerse.git
+        cd EgoVerse
+        python egomimic/scripts/data_download/sync_s3.py \\
+            --local-dir ./data --filters aria-fold-clothes
+        ```
+        """)
+
     st.divider()
 
-    # ── Section 4: The Vision ──
-    st.header("4. The Bigger Picture")
+    # Sidebar controls for video mode
+    with st.sidebar:
+        st.header("Video Model Controls")
+        frame_size = st.select_slider("Frame size", options=[32, 64, 128], value=64)
+        latent_dim = st.select_slider("Latent dim", options=[64, 128, 256], value=128)
+        vid_n_epochs = st.slider("Training epochs (video)", 10, 200, 50, 10, key="vid_epochs")
+        vid_lr = st.select_slider("Learning rate (video)",
+            options=[1e-4, 3e-4, 1e-3, 3e-3], value=1e-3, key="vid_lr")
+        vid_batch = st.select_slider("Batch size (video)",
+            options=[4, 8, 16, 32], value=8, key="vid_batch")
+
+    # Data source selection
+    st.subheader("1. Load Video Data")
+    data_source = st.radio(
+        "Data source",
+        ["Synthetic Physics Video (demo)", "Upload Video File", "EgoVerse (local)"],
+        horizontal=True,
+    )
+
+    frames = None
+
+    if data_source == "Synthetic Physics Video (demo)":
+        col1, col2 = st.columns(2)
+        with col1:
+            syn_objects = st.slider("Objects in scene", 2, 6, 3, key="syn_obj")
+            syn_gravity = st.slider("Gravity", 1.0, 20.0, 9.81, key="syn_g")
+        with col2:
+            syn_frames = st.slider("Number of frames", 30, 200, 80, key="syn_frames")
+
+        if st.button("Generate Synthetic Video", type="primary", use_container_width=True):
+            with st.spinner("Rendering physics simulation to video..."):
+                frames, masses = EgoVerseLoader.generate_synthetic_video(
+                    n_frames=syn_frames,
+                    frame_size=frame_size,
+                    n_objects=syn_objects,
+                    gravity=syn_gravity,
+                )
+            st.session_state['video_frames'] = frames
+            st.success(f"Generated {len(frames)} frames at {frame_size}x{frame_size}")
+
+    elif data_source == "Upload Video File":
+        uploaded = st.file_uploader("Upload a video (MP4, AVI, MOV)", type=["mp4", "avi", "mov"])
+        if uploaded:
+            tmp_path = f"/tmp/uploaded_video.{uploaded.name.split('.')[-1]}"
+            with open(tmp_path, 'wb') as f:
+                f.write(uploaded.read())
+            with st.spinner("Extracting frames..."):
+                frames = EgoVerseLoader.load_local_video(tmp_path, frame_size=frame_size)
+            if frames is not None:
+                st.session_state['video_frames'] = frames
+                st.success(f"Loaded {len(frames)} frames at {frame_size}x{frame_size}")
+            else:
+                st.error("Could not load video. Install opencv-python: `pip install opencv-python`")
+
+    elif data_source == "EgoVerse (local)":
+        ego_path = st.text_input("Path to EgoVerse data directory",
+                                  placeholder="/path/to/EgoVerse/data")
+        if ego_path and os.path.exists(ego_path):
+            st.info("EgoVerse Zarr loading — looking for episode data...")
+            # List available episodes
+            try:
+                episodes = [d for d in os.listdir(ego_path) if os.path.isdir(os.path.join(ego_path, d))]
+                if episodes:
+                    st.write(f"Found {len(episodes)} episodes")
+                    selected = st.selectbox("Select episode", episodes[:50])
+                    st.markdown("*Full EgoVerse integration requires the EgoVerse package. "
+                                "Use synthetic mode for the demo.*")
+            except Exception as e:
+                st.error(f"Error reading directory: {e}")
+        elif ego_path:
+            st.warning("Directory not found. Download EgoVerse data first (see instructions above).")
+
+    # Show loaded frames
+    if 'video_frames' in st.session_state:
+        frames = st.session_state['video_frames']
+        fig = plot_video_frames(frames, title=f"Input Video — {len(frames)} frames")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ── Train video world model ──
+    st.subheader("2. Train Video World Model")
     st.markdown("""
-    ### What this demonstrates
-
-    This MVP shows that a neural network can **discover physics from scratch** —
-    given only trajectories, it learns internal representations that correspond
-    to real physical quantities (gravity, energy, momentum).
-
-    ### Harrison's vision: scaling this up
-
-    1. **Video input**: Replace structured state vectors with raw video frames
-       (using a vision encoder like a ViT or CNN)
-    2. **More complex physics**: Fluids, deformable bodies, electromagnetic fields
-    3. **Foundation model**: Train on diverse environments so the model develops
-       *general* physics understanding, not just one scenario
-    4. **Novel discovery**: Once the model generalizes, expose it to new phenomena
-       (biology, chemistry) and see what laws it discovers
-    5. **Interpretability**: The linear probe approach scales — we can ask
-       "what does neuron X encode?" and find physics concepts
-
-    ### Architecture (from the paper)
-
-    ```
-    Physics Simulator (MuJoCo / Isaac Gym / Bullet)
-         ↓
-    Latent World Model (learns environment dynamics)
-         ↓
-    Policy Learning (RL + Imitation + Control)
-         ↓
-    Real-World Feedback Loops
-    ```
-
-    The key innovation is making physics discovery the **reward signal**,
-    not a constraint. The model doesn't just use physics — it *finds* physics.
+    The model sees frame pairs and learns to predict the next frame.
+    To predict object motion, falling, collisions — it must learn physics.
     """)
+
+    if 'video_frames' not in st.session_state:
+        st.info("Load video data first.")
+        return
+
+    frames = st.session_state['video_frames']
+
+    if st.button("Train Video Model", type="primary", use_container_width=True):
+        engine = VideoPhysicsEngine(
+            frame_size=frame_size,
+            latent_dim=latent_dim,
+            lr=vid_lr,
+        )
+
+        progress = st.progress(0)
+        status = st.empty()
+        chart_placeholder = st.empty()
+
+        losses = []
+        metrics_list = []
+
+        for epoch in range(vid_n_epochs):
+            epoch_losses = []
+            for _ in range(5):
+                loss = engine.train_step(frames, batch_size=vid_batch)
+                epoch_losses.append(loss)
+
+            avg_loss = np.mean(epoch_losses)
+            losses.append(avg_loss)
+
+            if epoch % 5 == 0 or epoch == vid_n_epochs - 1:
+                metrics = engine.evaluate(frames)
+                metrics['epoch'] = epoch
+                metrics_list.append(metrics)
+
+                status.markdown(
+                    f"**Epoch {epoch+1}/{vid_n_epochs}** — "
+                    f"Loss: `{avg_loss:.6f}` — "
+                    f"PSNR: `{metrics['psnr']:.1f} dB` — "
+                    f"Gravity probe: `{metrics['gravity_probe']:.3f}`"
+                )
+
+            progress.progress((epoch + 1) / vid_n_epochs)
+
+            if epoch % 10 == 0 or epoch == vid_n_epochs - 1:
+                fig = make_subplots(rows=1, cols=2,
+                    subplot_titles=['Reconstruction Loss', 'PSNR (higher = better)'])
+                fig.add_trace(go.Scatter(y=losses, mode='lines',
+                    line=dict(color='#00d4ff'), name='Loss'), row=1, col=1)
+                if metrics_list:
+                    fig.add_trace(go.Scatter(
+                        x=[m['epoch'] for m in metrics_list],
+                        y=[m['psnr'] for m in metrics_list],
+                        mode='lines+markers',
+                        line=dict(color='#6bcb77'), name='PSNR'
+                    ), row=1, col=2)
+                fig.update_layout(height=300, template='plotly_dark', showlegend=False)
+                chart_placeholder.plotly_chart(fig, use_container_width=True)
+
+        st.session_state['video_engine'] = engine
+        st.session_state['video_losses'] = losses
+        st.session_state['video_metrics'] = metrics_list
+        st.success("Video model training complete!")
+
+    st.divider()
+
+    # ── Results ──
+    st.subheader("3. Video Prediction Results")
+
+    if 'video_engine' not in st.session_state:
+        st.info("Train the video model first.")
+        return
+
+    engine = st.session_state['video_engine']
+    metrics_list = st.session_state['video_metrics']
+
+    final = metrics_list[-1]
+    col1, col2, col3 = st.columns(3)
+    col1.metric("PSNR", f"{final['psnr']:.1f} dB")
+    col2.metric("MSE", f"{final['mse']:.6f}")
+    col3.metric("Gravity Probe", f"{final['gravity_probe']:.3f}")
+
+    # Show predictions
+    st.markdown("**Predicted vs Ground Truth Frames**")
+    n_pred = min(20, len(frames) - 1)
+    pred_frames = engine.get_prediction_frames(frames, start_idx=0, n_predict=n_pred)
+    true_frames = frames[1:n_pred+1]
+
+    fig = plot_video_predictions(true_frames, pred_frames, n_show=6)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("""
+    **What's happening**: The model receives one frame and autoregressively
+    predicts the next N frames. Blurriness = uncertainty about physics.
+    As training improves, predictions sharpen because the model develops
+    a better internal physics model.
+    """)
+
+
+def main():
+    st.set_page_config(
+        page_title="Physics Discovery Engine",
+        page_icon="🔬",
+        layout="wide"
+    )
+
+    st.title("Physics Discovery Engine")
+    st.markdown("""
+    **Can a neural network learn Newton's laws from scratch?**
+
+    Instead of encoding physics as constraints, this model is *rewarded* for
+    discovering physics. It watches simulations and must learn to predict
+    what happens next. To predict well, it must implicitly learn gravity, momentum,
+    and collisions — like a baby learning about the world.
+
+    *Inspired by conversations with Chelsea Finn on world models and physics-founded reasoning.*
+    """)
+
+    st.divider()
+
+    tab1, tab2, tab3 = st.tabs([
+        "2D Physics Simulation",
+        "Video World Model + EgoVerse",
+        "The Vision"
+    ])
+
+    with tab1:
+        run_simulation_tab()
+
+    with tab2:
+        run_video_tab()
+
+    with tab3:
+        st.header("The Bigger Picture")
+        st.markdown("""
+        ### What this demonstrates
+
+        This MVP shows that a neural network can **discover physics from scratch** —
+        given only trajectories or video, it learns internal representations that correspond
+        to real physical quantities (gravity, energy, momentum).
+
+        ### Scaling this up
+
+        1. **Video input**: The Video World Model tab shows how to go from structured
+           state vectors to raw pixel observations using a CNN encoder/decoder
+        2. **EgoVerse integration**: 129M frames of real-world manipulation data —
+           objects being picked up, poured, folded, assembled. All governed by real physics.
+        3. **Foundation model**: Train on diverse EgoVerse environments so the model develops
+           *general* physics understanding, not just one scenario
+        4. **Novel discovery**: Once the model generalizes, expose it to new phenomena
+           (biology, chemistry) and see what laws it discovers
+        5. **Interpretability**: The linear probe approach scales — we can ask
+           "what does neuron X encode?" and find physics concepts
+
+        ### Architecture
+
+        ```
+        Data Source (Simulator / EgoVerse Video / Isaac Gym)
+             |
+        Frame Encoder (CNN / ViT)
+             |
+        Latent World Model (learns environment dynamics)
+             |
+        Physics Probes (linear decoders for gravity, energy, momentum)
+             |
+        Frame Decoder (reconstruct predicted frames)
+        ```
+
+        ### The key innovation
+
+        Making physics discovery the **reward signal**, not a constraint.
+        The model doesn't just use physics — it *finds* physics.
+
+        ### EgoVerse as training data
+
+        EgoVerse provides the bridge from toy simulations to reality:
+        - **54,088 episodes** of humans manipulating objects
+        - **400 real-world scenes** (kitchens, workshops, labs)
+        - **4,949 unique tasks** (pouring, folding, cutting, assembling)
+        - Paired **action + observation** data for state-action world models
+        - Available in **Zarr format** for efficient frame-level random access
+
+        The model watches humans interact with the physical world and must
+        learn the rules governing those interactions — just like a baby does.
+        """)
 
 
 if __name__ == "__main__":
