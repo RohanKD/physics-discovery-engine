@@ -513,7 +513,17 @@ class PhysicsDiscoveryEngine:
     def __init__(self, n_objects=3, lr=1e-3):
         self.n_objects = n_objects
         self.model = PhysicsPredictor(n_objects)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+
+        # Separate probe params from main model params
+        probe_params = set(
+            list(self.model.gravity_probe.parameters()) +
+            list(self.model.energy_probe.parameters()) +
+            list(self.model.momentum_probe.parameters())
+        )
+        main_params = [p for p in self.model.parameters() if p not in probe_params]
+
+        self.optimizer = optim.Adam(main_params, lr=lr)
+        self.probe_optimizer = optim.Adam(list(probe_params), lr=1e-3)
         self.loss_fn = nn.MSELoss()
         self.training_losses = []
         self.physics_metrics = []
@@ -588,13 +598,7 @@ class PhysicsDiscoveryEngine:
         # True momentum: sum of velocities (simplified)
         gt_momentum = torch.sum(vel, dim=1)  # (batch, 2)
 
-        # Train probes with frozen encoder
-        probe_optimizer = optim.SGD([
-            {'params': self.model.gravity_probe.parameters()},
-            {'params': self.model.energy_probe.parameters()},
-            {'params': self.model.momentum_probe.parameters()},
-        ], lr=0.01)
-
+        # Train probes with frozen encoder using persistent optimizer
         z_detached = z.detach()
         pred_gravity = self.model.gravity_probe(z_detached)
         pred_energy = self.model.energy_probe(z_detached)
@@ -604,9 +608,15 @@ class PhysicsDiscoveryEngine:
                       self.loss_fn(pred_energy, gt_energy) * 0.01 +
                       self.loss_fn(pred_momentum, gt_momentum) * 0.1)
 
-        probe_optimizer.zero_grad()
+        self.probe_optimizer.zero_grad()
         probe_loss.backward()
-        probe_optimizer.step()
+
+        # Clip probe gradients to prevent blowup
+        torch.nn.utils.clip_grad_norm_(self.model.gravity_probe.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.model.energy_probe.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.model.momentum_probe.parameters(), 1.0)
+
+        self.probe_optimizer.step()
 
     def evaluate_physics_discovery(self, data):
         """How well has the model discovered physics?"""
@@ -1353,22 +1363,28 @@ def run_interactive_tab():
                 px_def, py_def = 3.0 + i * 2.0, 5.0
                 vx_def, vy_def = 0.0, 0.0
             elif preset == "Orbit-like":
-                angle = i * 2 * np.pi / n_objects
-                px_def = 5.0 + 3.0 * np.cos(angle)
-                py_def = 5.0 + 3.0 * np.sin(angle)
-                vx_def = -3.0 * np.sin(angle)
-                vy_def = 3.0 * np.cos(angle)
+                angle = float(i * 2 * np.pi / max(n_objects, 1))
+                px_def = float(5.0 + 3.0 * np.cos(angle))
+                py_def = float(5.0 + 3.0 * np.sin(angle))
+                vx_def = float(-3.0 * np.sin(angle))
+                vy_def = float(3.0 * np.cos(angle))
             else:
                 px_def, py_def = 2.0 + i * 2.5, 5.0
                 vx_def, vy_def = 0.0, 0.0
 
-            px = st.number_input(f"x position", 0.1, 9.9, min(max(px_def, 0.5), 9.5),
+            # Ensure all defaults are Python floats and in valid range
+            px_def = float(min(max(px_def, 0.5), 9.5))
+            py_def = float(min(max(py_def, 0.5), 9.5))
+            vx_def = float(max(-10.0, min(10.0, vx_def)))
+            vy_def = float(max(-10.0, min(10.0, vy_def)))
+
+            px = st.number_input(f"x pos", 0.1, 9.9, px_def,
                                   step=0.5, key=f"px_{i}")
-            py = st.number_input(f"y position", 0.1, 9.9, min(max(py_def, 0.5), 9.5),
+            py = st.number_input(f"y pos", 0.1, 9.9, py_def,
                                   step=0.5, key=f"py_{i}")
-            vx = st.number_input(f"x velocity", -10.0, 10.0, float(np.clip(vx_def, -10, 10)),
+            vx = st.number_input(f"x vel", -10.0, 10.0, vx_def,
                                   step=0.5, key=f"vx_{i}")
-            vy = st.number_input(f"y velocity", -10.0, 10.0, float(np.clip(vy_def, -10, 10)),
+            vy = st.number_input(f"y vel", -10.0, 10.0, vy_def,
                                   step=0.5, key=f"vy_{i}")
             mass = st.number_input(f"mass", 0.1, 5.0, 1.0, step=0.1, key=f"mass_{i}")
 
