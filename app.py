@@ -1295,6 +1295,420 @@ def run_video_tab():
     """)
 
 
+def run_interactive_tab():
+    """Interactive live simulation where users design their own physics experiments."""
+
+    st.header("Interactive Physics Lab")
+    st.markdown("""
+    Design your own physics experiment. Place objects, set their velocities,
+    and watch the simulation play out. Then see if the trained model can predict
+    what happens.
+    """)
+
+    # ── Object configuration ──
+    st.subheader("1. Design Your Experiment")
+
+    with st.sidebar:
+        st.header("Interactive Lab Controls")
+        lab_gravity = st.slider("Gravity", 0.0, 30.0, 9.81, 0.1, key="lab_g")
+        lab_restitution = st.slider("Bounciness", 0.0, 1.0, 0.8, 0.05, key="lab_r")
+        lab_steps = st.slider("Simulation steps", 30, 300, 120, 10, key="lab_steps")
+        lab_dt = st.select_slider("Time step", options=[0.005, 0.01, 0.02, 0.04], value=0.02, key="lab_dt")
+        lab_speed = st.slider("Playback speed (ms/frame)", 10, 200, 50, 10, key="lab_speed")
+
+    n_objects = st.slider("Number of objects", 1, 8, 3, key="lab_n")
+
+    st.markdown("**Configure each object:**")
+
+    objects = []
+    cols_per_row = min(n_objects, 4)
+
+    for i in range(n_objects):
+        if i % cols_per_row == 0:
+            cols = st.columns(cols_per_row)
+
+        col = cols[i % cols_per_row]
+        with col:
+            st.markdown(f"**Object {i+1}**")
+            preset = st.selectbox(
+                f"Preset #{i+1}",
+                ["Custom", "Drop from top", "Launch right", "Launch up",
+                 "Fast diagonal", "Stationary", "Orbit-like"],
+                key=f"preset_{i}"
+            )
+
+            if preset == "Drop from top":
+                px_def, py_def = 2.0 + i * 2.5, 9.0
+                vx_def, vy_def = 0.0, 0.0
+            elif preset == "Launch right":
+                px_def, py_def = 1.0, 2.0 + i * 1.5
+                vx_def, vy_def = 5.0, 3.0
+            elif preset == "Launch up":
+                px_def, py_def = 3.0 + i * 2.0, 1.0
+                vx_def, vy_def = 0.0, 8.0
+            elif preset == "Fast diagonal":
+                px_def, py_def = 1.0, 1.0 + i * 2.0
+                vx_def, vy_def = 6.0, 6.0
+            elif preset == "Stationary":
+                px_def, py_def = 3.0 + i * 2.0, 5.0
+                vx_def, vy_def = 0.0, 0.0
+            elif preset == "Orbit-like":
+                angle = i * 2 * np.pi / n_objects
+                px_def = 5.0 + 3.0 * np.cos(angle)
+                py_def = 5.0 + 3.0 * np.sin(angle)
+                vx_def = -3.0 * np.sin(angle)
+                vy_def = 3.0 * np.cos(angle)
+            else:
+                px_def, py_def = 2.0 + i * 2.5, 5.0
+                vx_def, vy_def = 0.0, 0.0
+
+            px = st.number_input(f"x position", 0.1, 9.9, min(max(px_def, 0.5), 9.5),
+                                  step=0.5, key=f"px_{i}")
+            py = st.number_input(f"y position", 0.1, 9.9, min(max(py_def, 0.5), 9.5),
+                                  step=0.5, key=f"py_{i}")
+            vx = st.number_input(f"x velocity", -10.0, 10.0, float(np.clip(vx_def, -10, 10)),
+                                  step=0.5, key=f"vx_{i}")
+            vy = st.number_input(f"y velocity", -10.0, 10.0, float(np.clip(vy_def, -10, 10)),
+                                  step=0.5, key=f"vy_{i}")
+            mass = st.number_input(f"mass", 0.1, 5.0, 1.0, step=0.1, key=f"mass_{i}")
+
+            objects.append({
+                'pos': [px, py], 'vel': [vx, vy], 'mass': mass
+            })
+
+    st.divider()
+
+    # ── Run simulation ──
+    st.subheader("2. Run Simulation")
+
+    scenario_presets = st.selectbox("Or try a preset scenario:", [
+        "Use objects above",
+        "Newton's Cradle",
+        "Projectile Motion",
+        "Billiards Break",
+        "Rain (many objects falling)",
+        "Collision Course",
+    ])
+
+    if scenario_presets == "Newton's Cradle":
+        objects = [
+            {'pos': [2.0, 5.0], 'vel': [4.0, 0.0], 'mass': 1.0},
+            {'pos': [5.0, 5.0], 'vel': [0.0, 0.0], 'mass': 1.0},
+            {'pos': [5.6, 5.0], 'vel': [0.0, 0.0], 'mass': 1.0},
+            {'pos': [6.2, 5.0], 'vel': [0.0, 0.0], 'mass': 1.0},
+        ]
+        n_objects = 4
+    elif scenario_presets == "Projectile Motion":
+        objects = [
+            {'pos': [1.0, 1.0], 'vel': [4.0, 8.0], 'mass': 1.0},
+            {'pos': [1.0, 1.0], 'vel': [6.0, 6.0], 'mass': 0.5},
+            {'pos': [1.0, 1.0], 'vel': [3.0, 10.0], 'mass': 2.0},
+        ]
+        n_objects = 3
+    elif scenario_presets == "Billiards Break":
+        objects = [
+            {'pos': [2.0, 5.0], 'vel': [6.0, 0.0], 'mass': 1.0},
+            {'pos': [6.0, 5.0], 'vel': [0.0, 0.0], 'mass': 1.0},
+            {'pos': [6.5, 5.3], 'vel': [0.0, 0.0], 'mass': 1.0},
+            {'pos': [6.5, 4.7], 'vel': [0.0, 0.0], 'mass': 1.0},
+            {'pos': [7.0, 5.6], 'vel': [0.0, 0.0], 'mass': 1.0},
+            {'pos': [7.0, 5.0], 'vel': [0.0, 0.0], 'mass': 1.0},
+            {'pos': [7.0, 4.4], 'vel': [0.0, 0.0], 'mass': 1.0},
+        ]
+        n_objects = 7
+    elif scenario_presets == "Rain (many objects falling)":
+        objects = [
+            {'pos': [1 + i * 1.1, 8.0 + np.random.uniform(-1, 1)],
+             'vel': [np.random.uniform(-0.5, 0.5), 0.0],
+             'mass': np.random.uniform(0.3, 1.0)}
+            for i in range(8)
+        ]
+        n_objects = 8
+    elif scenario_presets == "Collision Course":
+        objects = [
+            {'pos': [1.0, 5.0], 'vel': [5.0, 0.0], 'mass': 2.0},
+            {'pos': [9.0, 5.0], 'vel': [-5.0, 0.0], 'mass': 2.0},
+            {'pos': [5.0, 1.0], 'vel': [0.0, 5.0], 'mass': 1.0},
+            {'pos': [5.0, 9.0], 'vel': [0.0, -5.0], 'mass': 1.0},
+        ]
+        n_objects = 4
+
+    if st.button("Run Simulation", type="primary", use_container_width=True):
+        # Build initial state
+        positions = np.array([o['pos'] for o in objects])
+        velocities = np.array([o['vel'] for o in objects])
+        masses = np.array([o['mass'] for o in objects])
+        radii = masses * 0.2 + 0.15
+
+        world = PhysicsWorld(
+            n_objects=n_objects,
+            gravity=lab_gravity,
+            restitution=lab_restitution,
+            dt=lab_dt,
+        )
+
+        # Run simulation
+        trajectory = [positions.copy()]
+        vel_history = [velocities.copy()]
+        energy_history = []
+
+        for step in range(lab_steps):
+            # Track energy
+            ke = 0.5 * np.sum(masses[:, None] * velocities ** 2)
+            pe = np.sum(masses * lab_gravity * positions[:, 1])
+            energy_history.append({'ke': ke, 'pe': pe, 'total': ke + pe})
+
+            positions, velocities = world.step(positions, velocities, masses, radii)
+            trajectory.append(positions.copy())
+            vel_history.append(velocities.copy())
+
+        trajectory = np.array(trajectory)
+        vel_history = np.array(vel_history)
+
+        st.session_state['lab_trajectory'] = trajectory
+        st.session_state['lab_velocities'] = vel_history
+        st.session_state['lab_masses'] = masses
+        st.session_state['lab_radii'] = radii
+        st.session_state['lab_energy'] = energy_history
+        st.session_state['lab_n_objects'] = n_objects
+        st.session_state['lab_gravity'] = lab_gravity
+
+    # ── Display results ──
+    if 'lab_trajectory' not in st.session_state:
+        st.info("Configure objects above and click Run Simulation.")
+        return
+
+    trajectory = st.session_state['lab_trajectory']
+    masses = st.session_state['lab_masses']
+    radii = st.session_state['lab_radii']
+    energy_history = st.session_state['lab_energy']
+    n_obj = st.session_state['lab_n_objects']
+
+    # Animated playback with Plotly
+    st.subheader("3. Live Simulation")
+
+    colors = px.colors.qualitative.Set2[:n_obj] + px.colors.qualitative.Pastel[:max(0, n_obj-8)]
+
+    # Build animation frames
+    frames_list = []
+    for t in range(len(trajectory)):
+        frame_data = []
+        # Trails up to current time
+        for obj_idx in range(n_obj):
+            trail_end = t + 1
+            frame_data.append(go.Scatter(
+                x=trajectory[:trail_end, obj_idx, 0],
+                y=trajectory[:trail_end, obj_idx, 1],
+                mode='lines',
+                line=dict(color=colors[obj_idx % len(colors)], width=1),
+                opacity=0.3,
+                showlegend=False,
+            ))
+        # Current positions
+        for obj_idx in range(n_obj):
+            frame_data.append(go.Scatter(
+                x=[trajectory[t, obj_idx, 0]],
+                y=[trajectory[t, obj_idx, 1]],
+                mode='markers',
+                marker=dict(
+                    size=radii[obj_idx] * 30 + 8,
+                    color=colors[obj_idx % len(colors)],
+                    line=dict(width=2, color='white'),
+                ),
+                name=f'Obj {obj_idx+1} (m={masses[obj_idx]:.1f})',
+                showlegend=(t == 0),
+            ))
+        frames_list.append(go.Frame(data=frame_data, name=str(t)))
+
+    # Initial frame
+    init_data = []
+    for obj_idx in range(n_obj):
+        init_data.append(go.Scatter(
+            x=[trajectory[0, obj_idx, 0]],
+            y=[trajectory[0, obj_idx, 1]],
+            mode='lines',
+            line=dict(color=colors[obj_idx % len(colors)], width=1),
+            opacity=0.3,
+            showlegend=False,
+        ))
+    for obj_idx in range(n_obj):
+        init_data.append(go.Scatter(
+            x=[trajectory[0, obj_idx, 0]],
+            y=[trajectory[0, obj_idx, 1]],
+            mode='markers',
+            marker=dict(
+                size=radii[obj_idx] * 30 + 8,
+                color=colors[obj_idx % len(colors)],
+                line=dict(width=2, color='white'),
+            ),
+            name=f'Obj {obj_idx+1} (m={masses[obj_idx]:.1f})',
+        ))
+
+    fig = go.Figure(data=init_data, frames=frames_list)
+
+    fig.update_layout(
+        xaxis=dict(range=[0, 10], title='x'),
+        yaxis=dict(range=[0, 10], title='y', scaleanchor='x'),
+        height=550,
+        template='plotly_dark',
+        title="Live Physics Simulation (press Play)",
+        updatemenus=[{
+            'type': 'buttons',
+            'showactive': False,
+            'y': 1.15,
+            'x': 0.5,
+            'xanchor': 'center',
+            'buttons': [
+                {
+                    'label': 'Play',
+                    'method': 'animate',
+                    'args': [None, {
+                        'frame': {'duration': lab_speed, 'redraw': True},
+                        'fromcurrent': True,
+                        'transition': {'duration': 0},
+                    }],
+                },
+                {
+                    'label': 'Pause',
+                    'method': 'animate',
+                    'args': [[None], {
+                        'frame': {'duration': 0, 'redraw': False},
+                        'mode': 'immediate',
+                        'transition': {'duration': 0},
+                    }],
+                },
+                {
+                    'label': 'Reset',
+                    'method': 'animate',
+                    'args': [['0'], {
+                        'frame': {'duration': 0, 'redraw': True},
+                        'mode': 'immediate',
+                        'transition': {'duration': 0},
+                    }],
+                },
+            ],
+        }],
+        sliders=[{
+            'active': 0,
+            'steps': [
+                {'args': [[str(t)], {'frame': {'duration': 0, 'redraw': True},
+                                      'mode': 'immediate',
+                                      'transition': {'duration': 0}}],
+                 'label': str(t),
+                 'method': 'animate'}
+                for t in range(0, len(trajectory), max(1, len(trajectory) // 50))
+            ],
+            'x': 0.1,
+            'len': 0.8,
+            'y': -0.05,
+            'currentvalue': {
+                'prefix': 'Step: ',
+                'visible': True,
+            },
+            'transition': {'duration': 0},
+        }],
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Energy analysis ──
+    st.subheader("4. Energy Analysis")
+    st.markdown("Conservation of energy — does the simulation preserve total energy?")
+
+    if energy_history:
+        energy_fig = go.Figure()
+        steps = list(range(len(energy_history)))
+        energy_fig.add_trace(go.Scatter(
+            x=steps,
+            y=[e['ke'] for e in energy_history],
+            mode='lines', name='Kinetic Energy',
+            line=dict(color='#ff6b6b'),
+        ))
+        energy_fig.add_trace(go.Scatter(
+            x=steps,
+            y=[e['pe'] for e in energy_history],
+            mode='lines', name='Potential Energy',
+            line=dict(color='#6bcb77'),
+        ))
+        energy_fig.add_trace(go.Scatter(
+            x=steps,
+            y=[e['total'] for e in energy_history],
+            mode='lines', name='Total Energy',
+            line=dict(color='#ffd93d', width=2),
+        ))
+        energy_fig.update_layout(
+            height=350, template='plotly_dark',
+            xaxis_title='Step', yaxis_title='Energy',
+            title='Energy Over Time',
+        )
+        st.plotly_chart(energy_fig, use_container_width=True)
+
+    # ── Model prediction comparison ──
+    st.subheader("5. Can the Model Predict This?")
+    st.markdown("""
+    If you've trained a model in the **2D Physics Simulation** tab, you can
+    see how well it predicts your custom experiment.
+    """)
+
+    if 'engine' in st.session_state:
+        engine = st.session_state['engine']
+        model_n_obj = st.session_state['n_objects']
+
+        if n_obj == model_n_obj:
+            vel_history = st.session_state['lab_velocities']
+            model = engine.model
+            model.eval()
+
+            pred_positions = [trajectory[0]]
+            current_pos = trajectory[0].copy()
+            current_vel = vel_history[0].copy()
+
+            for t in range(len(trajectory) - 1):
+                state = np.concatenate([current_pos.flatten(), current_vel.flatten()])
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                with torch.no_grad():
+                    pred_next, _, _ = model(state_tensor)
+                pred = pred_next.squeeze().numpy()
+                current_pos = pred[:n_obj*2].reshape(n_obj, 2)
+                current_vel = pred[n_obj*2:].reshape(n_obj, 2)
+                pred_positions.append(current_pos.copy())
+
+            pred_positions = np.array(pred_positions)
+
+            comp_fig = make_subplots(rows=1, cols=2,
+                                      subplot_titles=['Your Experiment (Truth)', 'Model Prediction'])
+            for obj_idx in range(n_obj):
+                comp_fig.add_trace(go.Scatter(
+                    x=trajectory[:, obj_idx, 0], y=trajectory[:, obj_idx, 1],
+                    mode='lines+markers', marker=dict(size=3, color=colors[obj_idx % len(colors)]),
+                    line=dict(color=colors[obj_idx % len(colors)]),
+                    name=f'True {obj_idx+1}',
+                ), row=1, col=1)
+                comp_fig.add_trace(go.Scatter(
+                    x=pred_positions[:, obj_idx, 0], y=pred_positions[:, obj_idx, 1],
+                    mode='lines+markers', marker=dict(size=3, color=colors[obj_idx % len(colors)]),
+                    line=dict(color=colors[obj_idx % len(colors)], dash='dash'),
+                    name=f'Pred {obj_idx+1}',
+                ), row=1, col=2)
+
+            comp_fig.update_xaxes(range=[0, 10], row=1, col=1)
+            comp_fig.update_xaxes(range=[0, 10], row=1, col=2)
+            comp_fig.update_yaxes(range=[0, 10], row=1, col=1)
+            comp_fig.update_yaxes(range=[0, 10], row=1, col=2)
+            comp_fig.update_layout(height=450, template='plotly_dark')
+            st.plotly_chart(comp_fig, use_container_width=True)
+
+            # Compute error
+            error = np.mean((trajectory - pred_positions) ** 2)
+            st.metric("Mean Squared Error vs Truth", f"{error:.6f}")
+        else:
+            st.warning(f"Model was trained with {model_n_obj} objects, "
+                       f"but this experiment has {n_obj}. Train a new model with "
+                       f"matching object count to compare.")
+    else:
+        st.info("Train a model in the '2D Physics Simulation' tab first to compare predictions here.")
+
+
 def main():
     st.set_page_config(
         page_title="Physics Discovery Engine",
@@ -1316,8 +1730,9 @@ def main():
 
     st.divider()
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "2D Physics Simulation",
+        "Interactive Physics Lab",
         "Video World Model + EgoVerse",
         "The Vision"
     ])
@@ -1326,9 +1741,12 @@ def main():
         run_simulation_tab()
 
     with tab2:
-        run_video_tab()
+        run_interactive_tab()
 
     with tab3:
+        run_video_tab()
+
+    with tab4:
         st.header("The Bigger Picture")
         st.markdown("""
         ### What this demonstrates
